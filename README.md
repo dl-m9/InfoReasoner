@@ -31,9 +31,10 @@ At a high level, the workflow is:
 
 ## Environment Setup
 
-We recommend **two conda environments**:
+We recommend **three conda environments**:
 
 - One for **RL training** (Search-R1 + veRL).
+- One for the **retriever service** (Faiss / retrieval stack).
 - One for the **IG service**.
 
 ### 1. Training environment (Search-R1 / veRL)
@@ -76,6 +77,149 @@ pip install ray
 ```
 
 Make sure the IG service environment has access to the base model checkpoint used for reward computation (e.g., `Qwen/Qwen2.5-3B`).
+
+### 3. Retriever service environment (optional but recommended)
+
+If you run local retrieval (e.g., dense e5 + Faiss), use a dedicated environment:
+
+```bash
+conda create -n retriever python=3.10
+conda activate retriever
+
+# Recommended for GPU Faiss
+conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install transformers datasets pyserini
+conda install -c pytorch -c nvidia faiss-gpu=1.8.0
+
+# API server deps
+pip install fastapi uvicorn
+```
+
+## Retriever Setup (Build + Serve)
+
+This project expects a retriever endpoint like `http://127.0.0.1:8000/retrieve`.
+
+### 1. Prepare corpus and index
+
+You have two common options:
+
+#### Option A: use the provided corpus/index workflow
+
+```bash
+save_path=/path/to/retrieval_assets
+python scripts/download.py --save_path "$save_path"
+cat "$save_path"/part_* > "$save_path"/e5_Flat.index
+gzip -d "$save_path"/wiki-18.jsonl.gz
+```
+
+Then place assets where your launch script expects them, or pass explicit paths to the server.
+
+#### Option B: build your own index
+
+```bash
+bash search_r1/search/build_index.sh
+```
+
+Customize retriever model / corpus settings in that script before running.
+
+### 2. Launch retriever server
+
+Quick start with the provided launcher:
+
+```bash
+conda activate retriever
+bash retrieval_launch.sh
+```
+
+Or start manually with explicit paths:
+
+```bash
+python search_r1/search/retrieval_server.py \
+  --index_path /path/to/e5_Flat.index \
+  --corpus_path /path/to/wiki-18.jsonl \
+  --topk 3 \
+  --retriever_name e5 \
+  --retriever_model intfloat/e5-base-v2 \
+  --faiss_gpu
+```
+
+Default server bind is `0.0.0.0:8000`.
+
+### 3. Verify retriever
+
+Health/behavior can be checked by sending retrieval requests from training or from a simple curl:
+
+```bash
+curl -X POST http://127.0.0.1:8000/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What is the capital of France?","topk":3}'
+```
+
+### 4. Connect retriever to training
+
+In training scripts/configs, ensure:
+
+- `retriever.url` points to your running retriever service (typically `http://127.0.0.1:8000/retrieve`)
+- `retriever.topk` matches your desired retrieval depth
+
+For example, `train_grpo.sh` already sets:
+
+```bash
+retriever.url="http://127.0.0.1:8000/retrieve"
+retriever.topk=3
+```
+
+## End-to-End Quickstart (Retriever + IG + GRPO)
+
+The following sequence launches the full stack in three terminals.
+
+### Terminal 1: start retriever service
+
+```bash
+conda activate retriever
+bash retrieval_launch.sh
+```
+
+Expected endpoint: `http://127.0.0.1:8000/retrieve`
+
+### Terminal 2: start IG service
+
+```bash
+conda activate ig-service
+
+bash IG_service_launch.sh \
+  --port 310 \
+  --device cuda:0 \
+  --model-path Qwen/Qwen2.5-3B \
+  --num-generations 10 \
+  --max-concurrent-requests 4 \
+  --num-gpus 1
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:310/health
+```
+
+### Terminal 3: start GRPO training
+
+```bash
+conda activate searchr1
+
+# Optional overrides before launch
+export BASE_MODEL=/path/to/base-or-checkpoint
+export EXPERIMENT_NAME="$(date +%m%d-%H%M)-nq-train-grpo-ig"
+
+bash train_grpo.sh
+```
+
+### Common issues checklist
+
+- Retriever not reachable: verify `retriever.url` in training config points to `:8000/retrieve`.
+- IG timeout: increase `IG_TIMEOUT` and/or reduce `IG_BATCH_SIZE`.
+- GPU OOM in IG service: reduce `--max-concurrent-requests` or `--num-generations`.
+- Throughput bottleneck: use IG multi-GPU mode (`--num-gpus > 1`) and ensure sufficient request concurrency.
 
 ## Running the IG Service
 
